@@ -1,0 +1,400 @@
+---
+title: "Granulosa cell dynamics"
+output:
+  github_document:
+    toc: true
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(destiny)
+library(dplyr)
+library(viridis)
+```
+
+# Load the data
+```{r}
+mca.matrix <- readRDS("~/Data/single_cell_datasets/MCA/MCA_merged_mat.rds")
+mca.meta <- read.csv("~/Data/single_cell_datasets/MCA/MCA_All-batch-removed-assignments.csv", 
+                     row.names = 1)
+ovary.samples <- rownames(mca.meta)[which(mca.meta$Tissue == "Ovary")]
+ovary.meta <- mca.meta[ovary.samples,]
+ovary.matrix <- mca.matrix[,ovary.samples]
+
+rm(mca.matrix, mca.meta)
+```
+
+```{r}
+ovary <- CreateSeuratObject(raw.data = ovary.matrix, meta.data=ovary.meta,
+                            min.cells = 3, project = "Ovary")
+```
+
+# QC
+```{r}
+mito.genes <- grep(pattern = "^mt-", x = rownames(x = ovary@data), value = TRUE)
+percent.mito <- Matrix::colSums(ovary@raw.data[mito.genes, ])/Matrix::colSums(ovary@raw.data)
+
+ovary <- AddMetaData(object = ovary, metadata = percent.mito, col.name = "percent.mito")
+VlnPlot(object = ovary, features.plot = c("nGene", "nUMI", "percent.mito"), nCol = 3)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+GenePlot(object = ovary, gene1 = "nUMI", gene2 = "percent.mito")
+GenePlot(object = ovary, gene1 = "nUMI", gene2 = "nGene")
+```
+
+# Filtering
+```{r}
+ovary <- FilterCells(object = ovary, subset.names = c("nGene", "percent.mito"), 
+    low.thresholds = c(200, -Inf), high.thresholds = c(3500, 0.06))
+```
+
+# Normalize
+```{r}
+ovary <- NormalizeData(object = ovary, normalization.method = "LogNormalize", 
+    scale.factor = 10000)
+```
+
+```{r}
+ovary <- FindVariableGenes(object = ovary, mean.function = ExpMean, 
+                          dispersion.function = LogVMR,
+                          x.low.cutoff = 0.0125, x.high.cutoff = 5, 
+                          y.cutoff = 0.5)
+```
+
+```{r}
+length(x = ovary@var.genes)
+```
+
+# Regressing out technical variables
+
+```{r}
+ovary <- ScaleData(object = ovary, vars.to.regress = c("nUMI", "percent.mito"))
+```
+# Cell cycle classification
+```{r}
+cc.genes <- readLines(con = "~/Data/GeneLists/regev_lab_cell_cycle_genes.txt")
+#Split these genes into S markers and G2M markers
+s.genes <- cc.genes[1:43]
+s.genes <- rownames(ovary.matrix)[which(toupper(rownames(ovary.matrix)) %in% s.genes)]
+g2m.genes <- cc.genes[44:97]
+g2m.genes <- rownames(ovary.matrix)[which(toupper(rownames(ovary.matrix)) %in% g2m.genes)]
+```
+
+```{r}
+ovary <- CellCycleScoring(object = ovary, s.genes = s.genes, g2m.genes = g2m.genes, set.ident = TRUE)
+```
+
+```{r}
+ovary <- RunPCA(object = ovary, pcs.compute=100, pc.genes = ovary@var.genes, 
+                do.print = TRUE, pcs.print = 1:5, genes.print = 5)
+```
+
+```{r}
+PCAPlot(object=ovary)
+```
+
+# Any batch effects
+Two batches
+```{r}
+ovary <- SetIdent(ovary, ident.use=ovary@meta.data$Batch)
+```
+
+```{r}
+PCAPlot(object=ovary)
+```
+
+Not apparent by PCA--we'll see w/ tSNE later
+
+# Cluster
+```{r}
+PCElbowPlot(object = ovary, num.pc=100)
+```
+
+```{r}
+ovary <- FindClusters(object = ovary, reduction.type = "pca", dims.use = 1:25,
+                      resolution = 0.6, print.output = 0, save.SNN = TRUE, 
+                      random.seed=2018)
+```
+
+# tSNE
+```{r}
+ovary <- RunTSNE(ovary, dims.use = 1:25, do.fast = TRUE)
+```
+
+```{r}
+TSNEPlot(ovary)
+```
+
+```{r}
+DimPlot(ovary, group.by="Phase", reduction.use="tsne")
+DimPlot(ovary, group.by="Batch", reduction.use="tsne")
+DimPlot(ovary, group.by="ClusterID", reduction.use="tsne")
+```
+
+Oooo batch effects! Let's try to use Seurat's alignment procedure
+```{r}
+batch1_cells <- colnames(ovary@data)[which(ovary@meta.data$Batch=="Ovary_1")]
+batch2_cells <- colnames(ovary@data)[which(ovary@meta.data$Batch=="Ovary_2")]
+ovary.aligned <- RunCCA(ovary, group1=batch1_cells, group2=batch2_cells, num.cc = 30)
+```
+```{r}
+p1 <- DimPlot(object = ovary.aligned, reduction.use = "cca", group.by = "Batch", 
+    pt.size = 0.5, do.return = TRUE)
+p2 <- VlnPlot(object = ovary.aligned, features.plot = "CC1", group.by = "Batch", 
+    do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+```{r}
+PrintDim(object = ovary.aligned, reduction.type = "cca", dims.print = 1:2, 
+    genes.print = 10)
+```
+
+```{r}
+p3 <- MetageneBicorPlot(ovary.aligned, grouping.var = "Batch", dims.eval = 1:30, 
+    display.progress = FALSE)
+```
+
+```{r}
+ovary.aligned <- AlignSubspace(ovary.aligned, reduction.type = "cca", grouping.var = "Batch", 
+    dims.align = 1:20)
+```
+
+```{r}
+p1 <- VlnPlot(object = ovary.aligned, features.plot = "ACC1", group.by = "Batch", 
+    do.return = TRUE)
+p2 <- VlnPlot(object = ovary.aligned, features.plot = "ACC2", group.by = "Batch", 
+    do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+```{r}
+ovary.aligned <- RunTSNE(ovary.aligned, reduction.use = "cca.aligned", dims.use = 1:20, 
+    do.fast = T)
+ovary.aligned <- FindClusters(ovary.aligned, reduction.type = "cca.aligned", 
+    resolution = 0.6, dims.use = 1:20)
+```
+
+```{r}
+# Visualization
+p1 <- TSNEPlot(ovary.aligned, do.return = T, pt.size = 0.5, group.by = "Batch")
+p2 <- TSNEPlot(ovary.aligned, do.label = T, do.return = T, pt.size = 0.5)
+plot_grid(p1, p2)
+```
+
+```{r}
+TSNEPlot(ovary.aligned, do.return = T,group.by = "Batch")
+```
+
+```{r}
+cluster1.markers <- FindMarkers(object = ovary.aligned, ident.1 = 1, min.pct = 0.25)
+print(x = head(x = cluster1.markers, n = 30))
+```
+
+```{r}
+FeaturePlot(ovary.aligned, features.plot="Fshr", cols.use=viridis(100))
+```
+
+```{r}
+ovary.markers <- FindAllMarkers(object = ovary.aligned, 
+                               min.pct = 0.25, thresh.use = 0.5,
+                               print.bar=T, random.seed=2018)
+```
+
+```{r}
+#How many markers per cluster
+table(ovary.markers$cluster)
+```
+
+```{r}
+top_markers <- ovary.markers %>% group_by(cluster) %>% top_n(1, avg_logFC)
+```
+
+```{r}
+top5 <- ovary.markers %>% group_by(cluster) %>% top_n(5, avg_logFC)
+# setting slim.col.label to TRUE will print just the cluster IDS instead of
+# every cell name
+DoHeatmap(object = ovary.aligned, genes.use = top5$gene, slim.col.label = TRUE, remove.key = TRUE)
+```
+
+```{r}
+FeaturePlot(object = ovary.aligned, features.plot = top_markers$gene, 
+            cols.use = viridis(100), reduction.use = "tsne",
+            no.axes=T, pt.size=0.25)
+```
+
+# Mapping to cell types
+Okay, so let's try to assign each cluster to a specific cell type.
+
+## Cluster 0 - Granulosa
+
+```{r}
+ovary.markers %>% filter(cluster==0) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+Definitely granulosa cells. Not sure of stage just yet.
+Inhibin expressed in granulosa cells.
+This cluster (only one side of it, which is interesting) also expressed aromatase--the enzyme that converts androgens to estrogen
+Most markers I look at increase as you move towards the bottom right of the cluster--likely corresponds to follicle size, but not sure the directionality yet
+
+
+## Cluster 1 - Luteal? Thecal?
+
+```{r}
+ovary.markers %>% filter(cluster==1) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+
+This is a really large cluster. First thing I notice is the LH receptor. The authors of the MCA annotated this as luteal cells
+
+## Cluster 2
+
+```{r}
+ovary.markers %>% filter(cluster==2) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+Collagens and actins--definitely stroma
+
+
+## Cluster 3 - Theca/CL??
+
+```{r}
+ovary.markers %>% filter(cluster==3) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+Cyp17a1 expressed in theca cells
+Aldh1a1 expressed in theca interna--consistent expression between small and large follicles
+
+Only kicker is that they lack the LH receptor expression (well, there's a lot less of it). Perhaps this is associated with the corpus luteum. The proportion of cells falling in this cluster would make me think theca (whereas cluster 1 has a ton of cells--more than I would have thought from theca), but maybe I'm I'm wrong
+
+The authors of the MCA annotated this as thecal
+
+## Cluster 4 - Early-mid granulosa cells
+
+```{r}
+ovary.markers %>% filter(cluster==4) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+Amh increases during folliculogenesis but decreasing around ovulation
+Amhr2 is a classic marker of granulosa cells. Note that it's expression is also prevalent in Cluster 0
+Gatm apparently is up in small follicles and decreases in large follicles
+Also express some common markers with cluster 0 (one that is definitely granulosa cells; eg. Serpine2)
+
+
+## Cluster 5 - Unknown
+
+```{r}
+ovary.markers %>% filter(cluster==5) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+One study says PRSS23 is expressed in ovarian stroma and theca cells before ovulation. Also in atretic follicles
+Sox4 seems to be associated with ovarian stroma
+Mmp11 is also a stromal MMP
+
+Update: While some of these markers are stromal, there is a clear stromal cluster (cluster2) that expresses all the collagens and stuff we would expect.
+
+The MCA authors called this population cumulus cells
+
+
+## Cluster 6 - Endothelial cells?
+
+```{r}
+ovary.markers %>% filter(cluster==6) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+Cd34 has been associated with endothelial cells
+Ly6c1 is a lymphocyte antigen complex expressed in endothelial cells and a handful of immune cells
+Esam - endothelial specific cell adhesion molecule. 
+
+## Cluster 7 - Macrophages
+
+```{r}
+ovary.markers %>% filter(cluster==7) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+
+Lyz2 is a marker of macrophage activation
+CD74 is part of MHC class II
+Also literature about Apoe in macrophages
+
+## Cluster 8 - Ovarian surface epithelium
+
+```{r}
+ovary.markers %>% filter(cluster==8) %>% arrange(desc(avg_logFC)) %>% top_n(50, avg_logFC)
+```
+
+This definitely corresponds to the ovarian surface epithelium
+
+# Filtering dataset down
+So our clustering annotations aren't perfect, but I think we're at a point where we can filter down to granulosa cells, theca cells, and luteal cells
+
+```{r}
+TSNEPlot(ovary.aligned)
+```
+
+So we'll want to remove clusters 2, 6, 7, and 8
+
+```{r}
+follicle <- SubsetData(ovary.aligned, ident.use=c(0,1,3,4,5))
+```
+
+
+```{r}
+follicle <- FindVariableGenes(object = follicle, mean.function = ExpMean, 
+                          dispersion.function = LogVMR,
+                          x.low.cutoff = 0.0125, x.high.cutoff = 5, 
+                          y.cutoff = 0.5)
+```
+
+```{r}
+follicle <- RunPCA(follicle, pcs.compute=50, do.print=T, genes.print=5)
+```
+
+```{r}
+PCAPlot(follicle)
+```
+
+```{r}
+PCElbowPlot(object = follicle, num.pc=50)
+```
+
+```{r}
+follicle <- RunTSNE(follicle, do.fast=T, dims.use=1:20)
+```
+
+```{r}
+TSNEPlot(follicle)
+```
+
+
+```{r}
+follicle <- RunDiffusion(follicle, q.use=0, genes.use=follicle@var.genes)
+```
+
+# Diffusion map
+
+```{r}
+mat <- follicle@scale.data[follicle@var.genes,]
+dm <- DiffusionMap(t(mat), sigma="local")
+```
+
+```{r}
+plot(dm, pch=20)
+```
+
+```{r}
+dm.embeddings <- dm@eigenvectors[,1:6]
+colnames(dm.embeddings) <- paste0("DC", 1:6)
+rownames(dm.embeddings) <- colnames(mat)
+```
+
+```{r}
+follicle <- SetDimReduction(follicle, reduction.type="diffmap", slot="cell.embeddings", new.data=dm.embeddings)
+follicle <- SetDimReduction(follicle, reduction.type="diffmap", slot="key", new.data="DC")
+```
+
+```{r}
+DimPlot(follicle, reduction.use="diffmap")
+DimPlot(follicle, reduction.use="diffmap", dim.1=1, dim.2=3)
+```
+
+```{r}
+FeaturePlot(follicle, features.plot=c("Nap1l5", "Sfrp4", "Aldh1a1", "Kctd14", "Itm2b"), reduction.use="diffmap",
+            cols.use=viridis(100))
+```
+
